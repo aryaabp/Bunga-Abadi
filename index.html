@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>bunga abadi, disimpen ya sayang</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #020205;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: "Cascadia Mono", "Consolas", "Courier New", monospace;
+      -webkit-font-smoothing: antialiased;
+      touch-action: manipulation;
+    }
+
+    #stage {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+    }
+
+    canvas {
+      display: block;
+      background: #020205;
+    }
+
+    #replayBtn {
+      position: fixed;
+      bottom: 14px;
+      right: 14px;
+      background: rgba(255, 255, 255, 0.05);
+      color: rgba(247, 214, 230, 0.55);
+      border: 1px solid rgba(247, 214, 230, 0.16);
+      border-radius: 999px;
+      padding: 5px 11px;
+      font-family: inherit;
+      font-size: 11px;
+      letter-spacing: 0.4px;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.8s ease, background 0.2s ease, color 0.2s ease;
+      backdrop-filter: blur(4px);
+    }
+
+    #replayBtn.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    #replayBtn:hover {
+      background: rgba(247, 214, 230, 0.14);
+      color: rgba(255, 234, 244, 0.95);
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <button id="replayBtn" title="Ulang animasi mekar">↻ ulang</button>
+  </div>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById("cv");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const replayBtn = document.getElementById("replayBtn");
+
+      const MESSAGE = "bunga abadi, disimpen ya sayang";
+      const RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+      const NR = RAMP.length - 1;
+
+      // Grid resolution (matches the fine small-font Python ASCII bouquet)
+      const ROWS = 82;
+      const COLS = 140;
+      const N_CELLS = ROWS * COLS;
+
+      // Pre-allocated typed buffers for zero-GC smooth animation
+      const colR = new Float32Array(N_CELLS);
+      const colG = new Float32Array(N_CELLS);
+      const colB = new Float32Array(N_CELLS);
+      const zBuf = new Float32Array(N_CELLS);
+
+      // Deterministic PRNG for consistent dither & petal speckles
+      function mulberry32(seed) {
+        let a = seed >>> 0;
+        return () => {
+          a |= 0;
+          a = (a + 0x6D2B79F5) | 0;
+          let t = Math.imul(a ^ (a >>> 15), 1 | a);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      const rng = mulberry32(42);
+      const dither = new Float32Array(N_CELLS);
+      const speckleNoise = new Float32Array(N_CELLS);
+      for (let i = 0; i < N_CELLS; i++) {
+        dither[i] = (rng() - 0.5) * 0.08;
+        speckleNoise[i] = rng();
+      }
+
+      // Ambient rising sparkles
+      const N_SPARKS = 34;
+      const sparks = [];
+      for (let i = 0; i < N_SPARKS; i++) {
+        sparks.push({
+          x: 0.16 + rng() * 0.68,
+          y: 0.14 + rng() * 0.52,
+          vx: (rng() - 0.5) * 0.022,
+          vy: -(0.020 + rng() * 0.030),
+          age: rng() * 3.5,
+          life: 2.4 + rng() * 2.2,
+        });
+      }
+
+      // Baby's Breath (Gypsophila) filler positions around the bouquet
+      const BABYS_BREATH = [
+        [0.15, 0.34, 15.0], [0.14, 0.45, 15.2], [0.18, 0.60, 15.4],
+        [0.28, 0.22, 15.6], [0.43, 0.17, 15.8], [0.57, 0.17, 16.0],
+        [0.72, 0.22, 16.2], [0.85, 0.33, 16.4], [0.86, 0.45, 16.6],
+        [0.82, 0.60, 16.8], [0.31, 0.46, 17.0], [0.69, 0.46, 17.2],
+        [0.32, 0.61, 17.4], [0.68, 0.61, 17.6], [0.44, 0.38, 17.8],
+        [0.56, 0.38, 18.0], [0.42, 0.62, 18.2], [0.58, 0.62, 18.4],
+      ];
+
+      // Responsive layout variables
+      let W = 600, H = 740, CW = 4.2, CH = 9.0, ASPECT = 0.81;
+      let asciiFontPx = 7.5;
+      let msgFontPx = 11;
+
+      function resize() {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const targetRatio = 0.80; // Portrait bouquet ratio
+
+        let boxW = vw * 0.96;
+        let boxH = vh * 0.96;
+        if (boxW / boxH > targetRatio) {
+          boxW = boxH * targetRatio;
+        } else {
+          boxH = boxW / targetRatio;
+        }
+
+        // Cap max desktop size so font stays small, crisp & delicate
+        if (boxH > 780) {
+          boxH = 780;
+          boxW = boxH * targetRatio;
+        }
+
+        W = Math.floor(boxW);
+        H = Math.floor(boxH);
+        CW = W / COLS;
+        CH = H / ROWS;
+        ASPECT = W / H;
+
+        // Small font sizing proportional to cell height
+        asciiFontPx = Math.max(4.5, Math.min(8.5, CH * 0.96));
+        msgFontPx = Math.max(9.5, Math.min(12.5, H * 0.0175));
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.round(W * dpr);
+        canvas.height = Math.round(H * dpr);
+        canvas.style.width = `${W}px`;
+        canvas.style.height = `${H}px`;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+      }
+
+      window.addEventListener("resize", resize);
+      resize();
+
+      function clamp(v, lo = 0, hi = 1) {
+        return v < lo ? lo : v > hi ? hi : v;
+      }
+
+      function ease(t) {
+        t = clamp(t);
+        return t * t * (3 - 2 * t);
+      }
+
+      function quadBez(p0, p1, p2, s) {
+        const u = 1 - s;
+        return [
+          u * u * p0[0] + 2 * u * s * p1[0] + s * s * p2[0],
+          u * u * p0[1] + 2 * u * s * p1[1] + s * s * p2[1],
+        ];
+      }
+
+      // Helpers to iterate only over the bounding box of each element (super fast!)
+      function boundsFor(xMin, xMax, yMin, yMax) {
+        const c0 = Math.max(0, Math.floor(xMin * COLS));
+        const c1 = Math.min(COLS - 1, Math.ceil(xMax * COLS));
+        const r0 = Math.max(0, Math.floor(yMin * ROWS));
+        const r1 = Math.min(ROWS - 1, Math.ceil(yMax * ROWS));
+        return [r0, r1, c0, c1];
+      }
+
+      function drawCurveStem(p0, p1, p2, grow, halfW, zVal, tint = [0.06, 0.28, 0.12]) {
+        if (grow <= 0.01) return;
+        const nSeg = 22;
+        const cx = new Float32Array(nSeg);
+        const cy = new Float32Array(nSeg);
+        let minX = 1, maxX = 0, minY = 1, maxY = 0;
+
+        for (let k = 0; k < nSeg; k++) {
+          const s = (k / (nSeg - 1)) * grow;
+          const pt = quadBez(p0, p1, p2, s);
+          cx[k] = pt[0];
+          cy[k] = pt[1];
+          if (pt[0] < minX) minX = pt[0];
+          if (pt[0] > maxX) maxX = pt[0];
+          if (pt[1] < minY) minY = pt[1];
+          if (pt[1] > maxY) maxY = pt[1];
+        }
+
+        const padX = (halfW * 1.4) / ASPECT;
+        const padY = halfW * 1.4;
+        const [r0, r1, c0, c1] = boundsFor(minX - padX, maxX + padX, minY - padY, maxY + padY);
+
+        for (let r = r0; r <= r1; r++) {
+          const gy = (r + 0.5) / ROWS;
+          const rowOff = r * COLS;
+          for (let c = c0; c <= c1; c++) {
+            const idx = rowOff + c;
+            if (zVal < zBuf[idx]) continue;
+            const gx = (c + 0.5) / COLS;
+
+            let bestD2 = 1e9;
+            let bestK = 0;
+            for (let k = 0; k < nSeg; k++) {
+              const dx = (gx - cx[k]) * ASPECT;
+              const dy = gy - cy[k];
+              const d2 = dx * dx + dy * dy;
+              if (d2 < bestD2) {
+                bestD2 = d2;
+                bestK = k;
+              }
+            }
+
+            const sNear = (bestK / (nSeg - 1)) * grow;
+            const wLoc = halfW * (1 - 0.26 * sNear);
+            if (bestD2 <= wLoc * wLoc) {
+              const side = clamp(((gx - cx[bestK]) * ASPECT) / (wLoc + 1e-6), -1, 1);
+              const lit = clamp(0.55 - 0.45 * side, 0.18, 1);
+              colR[idx] = tint[0] + 0.14 * lit;
+              colG[idx] = tint[1] + 0.44 * lit;
+              colB[idx] = tint[2] + 0.22 * lit;
+              zBuf[idx] = zVal;
+            }
+          }
+        }
+      }
+
+      function drawLeaf(ax, ay, angDeg, length, width, bend, grow, zVal, teal = false) {
+        if (grow <= 0.02) return;
+        const L = length * grow;
+        const Wd = width * grow;
+        const ang = (angDeg * Math.PI) / 180;
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+
+        const maxR = L * 1.18 + Wd;
+        const [r0, r1, c0, c1] = boundsFor(ax - maxR / ASPECT, ax + maxR / ASPECT, ay - maxR, ay + maxR);
+
+        for (let r = r0; r <= r1; r++) {
+          const gy = (r + 0.5) / ROWS;
+          const dy = gy - ay;
+          const rowOff = r * COLS;
+          for (let c = c0; c <= c1; c++) {
+            const idx = rowOff + c;
+            if (zVal < zBuf[idx]) continue;
+            const gx = (c + 0.5) / COLS;
+            const dx = (gx - ax) * ASPECT;
+
+            const s = (dx * ca + dy * sa) / (L + 1e-6);
+            if (s < 0 || s > 1) continue;
+
+            const v = (-dx * sa + dy * ca) - bend * L * s * s;
+            const prof = Math.pow(Math.max(0, Math.sin(Math.PI * Math.pow(s, 0.72))), 0.90);
+            const wLoc = Wd * prof;
+            if (wLoc <= 0.001 || Math.abs(v) > wLoc) continue;
+
+            const vn = Math.abs(v) / (wLoc + 1e-6);
+            const vein = Math.exp(-Math.pow(vn / 0.14, 2));
+            const shade = (0.50 + 0.50 * Math.pow(1 - vn, 0.8)) * (0.65 + 0.35 * Math.max(0, Math.sin(Math.PI * s)));
+
+            if (teal) {
+              colR[idx] = clamp(0.06 + 0.14 * shade + 0.10 * vein);
+              colG[idx] = clamp(0.28 + 0.44 * shade + 0.16 * vein);
+              colB[idx] = clamp(0.24 + 0.36 * shade + 0.12 * vein);
+            } else {
+              colR[idx] = clamp(0.05 + 0.14 * shade + 0.12 * vein);
+              colG[idx] = clamp(0.24 + 0.52 * shade + 0.18 * vein);
+              colB[idx] = clamp(0.11 + 0.24 * shade + 0.10 * vein);
+            }
+            zBuf[idx] = zVal;
+          }
+        }
+      }
+
+      function drawRibbonBow(bx, by, grow, zVal) {
+        if (grow <= 0.02) return;
+
+        // Horizontal wrap band
+        const bandW = 0.052 * grow;
+        const bandH = 0.018 * grow;
+        let [r0, r1, c0, c1] = boundsFor(bx - bandW / ASPECT, bx + bandW / ASPECT, by - bandH, by + bandH);
+        for (let r = r0; r <= r1; r++) {
+          const dy = (r + 0.5) / ROWS - by;
+          if (Math.abs(dy) > bandH) continue;
+          const rowOff = r * COLS;
+          for (let c = c0; c <= c1; c++) {
+            const idx = rowOff + c;
+            if (zVal < zBuf[idx]) continue;
+            const dx = ((c + 0.5) / COLS - bx) * ASPECT;
+            if (Math.abs(dx) <= bandW) {
+              const sh = 0.72 + 0.28 * (1 - Math.abs(dy) / (bandH + 1e-6));
+              colR[idx] = clamp(0.95 * sh);
+              colG[idx] = clamp(0.56 * sh);
+              colB[idx] = clamp(0.70 * sh);
+              zBuf[idx] = zVal;
+            }
+          }
+        }
+
+        // Left & right bow loops
+        const loopR = 0.036 * grow;
+        for (const side of [-1, 1]) {
+          const lcx = bx + (side * 0.048 * grow) / ASPECT;
+          const lcy = by - 0.004;
+          [r0, r1, c0, c1] = boundsFor(lcx - loopR / ASPECT, lcx + loopR / ASPECT, lcy - loopR, lcy + loopR);
+          for (let r = r0; r <= r1; r++) {
+            const ldy = ((r + 0.5) / ROWS - lcy) * 1.45;
+            const rowOff = r * COLS;
+            for (let c = c0; c <= c1; c++) {
+              const idx = rowOff + c;
+              if (zVal + 0.3 < zBuf[idx]) continue;
+              const ldx = ((c + 0.5) / COLS - lcx) * ASPECT;
+              const rad = Math.hypot(ldx, ldy);
+              if (rad <= loopR && rad >= loopR * 0.42) {
+                const sh = 0.75 + 0.25 * (1 - Math.abs(rad - loopR * 0.72) / (loopR * 0.35 + 1e-6));
+                colR[idx] = clamp(0.98 * sh);
+                colG[idx] = clamp(0.62 * sh);
+                colB[idx] = clamp(0.76 * sh);
+                zBuf[idx] = zVal + 0.3;
+              }
+            }
+          }
+        }
+
+        // Flowing ribbon tails
+        for (const side of [-1, 1]) {
+          drawCurveStem(
+            [bx + (side * 0.010) / ASPECT, by + 0.010],
+            [bx + (side * 0.055) / ASPECT, by + 0.065],
+            [bx + (side * 0.085) / ASPECT, by + 0.130],
+            grow, 0.0085, zVal + 0.2, [0.82, 0.42, 0.58]
+          );
+        }
+
+        // Center knot
+        const kR = 0.016 * grow;
+        [r0, r1, c0, c1] = boundsFor(bx - kR / ASPECT, bx + kR / ASPECT, by - kR, by + kR);
+        for (let r = r0; r <= r1; r++) {
+          const dy = (r + 0.5) / ROWS - by;
+          const rowOff = r * COLS;
+          for (let c = c0; c <= c1; c++) {
+            const idx = rowOff + c;
+            if (zVal + 0.6 < zBuf[idx]) continue;
+            const dx = ((c + 0.5) / COLS - bx) * ASPECT;
+            if (dx * dx + dy * dy <= kR * kR) {
+              colR[idx] = 1.00;
+              colG[idx] = 0.72;
+              colB[idx] = 0.84;
+              zBuf[idx] = zVal + 0.6;
+            }
+          }
+        }
+      }
+
+      function drawLilyHead(hx, hy, radius, tiltDeg, budScale, bloom, t, zBase) {
+        if (budScale <= 0.02) return;
+        const tilt = (tiltDeg * Math.PI) / 180;
+        const Rbud = radius * (0.15 + 0.23 * budScale);
+        const breath = 1 + 0.020 * Math.sin(t * 1.3 + zBase) * bloom;
+        const Reff = (Rbud + (radius - Rbud) * bloom) * breath;
+        const maxR = Reff * 1.32;
+        const [r0, r1, c0, c1] = boundsFor(hx - maxR / ASPECT, hx + maxR / ASPECT, hy - maxR, hy + maxR);
+
+        const order = [0, 2, 4, 1, 3, 5];
+        for (let oi = 0; oi < 6; oi++) {
+          const pIdx = order[oi];
+          const isInner = (pIdx % 2) === 1;
+          const starAng = -Math.PI * 0.5 + pIdx * (Math.PI / 3) + tilt;
+          const budAng = -Math.PI * 0.5 + tilt + (pIdx - 2.5) * 0.075;
+          let diff = (starAng - budAng + Math.PI) % (2 * Math.PI);
+          if (diff < 0) diff += 2 * Math.PI;
+          diff -= Math.PI;
+          const ang = budAng + diff * Math.pow(bloom, 0.85);
+
+          const pLen = Reff * (isInner ? 0.96 : 1.06);
+          const pWid = Reff * (isInner ? 0.27 : 0.25) * (0.42 + 0.58 * bloom);
+          const bend = (pIdx === 1 || pIdx === 2 ? 0.10 : pIdx === 4 || pIdx === 5 ? -0.10 : 0) * bloom;
+          const ca = Math.cos(ang), sa = Math.sin(ang);
+
+          for (let r = r0; r <= r1; r++) {
+            const dy0 = (r + 0.5) / ROWS - hy;
+            const rowOff = r * COLS;
+            for (let c = c0; c <= c1; c++) {
+              const dx0 = ((c + 0.5) / COLS - hx) * ASPECT;
+              const s = (dx0 * ca + dy0 * sa) / (pLen + 1e-6);
+              if (s < 0 || s > 1) continue;
+
+              const zP = zBase + (isInner ? 2.0 : 1.0) + 0.5 * (1 - s);
+              const idx = rowOff + c;
+              if (zP < zBuf[idx]) continue;
+
+              const v = (-dx0 * sa + dy0 * ca) - bend * pLen * s * s;
+              const prof = Math.pow(Math.max(0, Math.sin(Math.PI * Math.pow(s, 0.78))), 0.85) * (1 - 0.16 * s);
+              const wLoc = pWid * prof;
+              if (wLoc <= 0.001 || Math.abs(v) > wLoc) continue;
+
+              const vn = Math.abs(v) / (wLoc + 1e-6);
+              const midrib = Math.exp(-Math.pow(vn / 0.38, 2));
+              const ridge = Math.exp(-Math.pow(vn / 0.10, 2));
+              const rim = clamp((vn - 0.70) / 0.30);
+              const throat = clamp(1 - s / 0.26);
+
+              let pr = 0.96 - 0.05 * s;
+              let pg = 0.76 - 0.44 * midrib * (1 - 0.45 * s) + 0.20 * rim;
+              let pb = 0.88 - 0.22 * midrib * (1 - 0.45 * s) + 0.12 * rim;
+
+              pr = pr * (1 - 0.25 * throat) + 0.85 * throat * 0.25;
+              pg = pg * (1 - 0.55 * throat) + 0.96 * throat * 0.55;
+              pb = pb * (1 - 0.65 * throat) + 0.48 * throat * 0.65;
+
+              const budTint = (1 - bloom) * clamp(1 - s * 1.1) * 0.55;
+              pr = pr * (1 - budTint) + 0.38 * budTint;
+              pg = pg * (1 - budTint) + 0.72 * budTint;
+              pb = pb * (1 - budTint) + 0.42 * budTint;
+
+              pr = clamp(pr + 0.10 * ridge);
+              pg = clamp(pg + 0.08 * ridge);
+              pb = clamp(pb + 0.09 * ridge);
+
+              if (bloom > 0.35 && s > 0.14 && s < 0.58 && vn < 0.52 && speckleNoise[idx] > 0.88) {
+                pr *= 0.85;
+                pg *= 0.30;
+                pb *= 0.48;
+              }
+
+              const depthShade = (isInner ? 0.98 : 0.82) * (0.76 + 0.24 * (1 - vn * 0.5)) * (0.68 + 0.32 * bloom);
+              colR[idx] = clamp(pr * depthShade);
+              colG[idx] = clamp(pg * depthShade);
+              colB[idx] = clamp(pb * depthShade);
+              zBuf[idx] = zP;
+            }
+          }
+        }
+
+        // Golden stamens
+        const stamGrow = ease((bloom - 0.30) / 0.70);
+        if (stamGrow > 0.05) {
+          const zStam = zBase + 4.0;
+          const antR = 0.011 * stamGrow;
+          for (let j = 0; j < 5; j++) {
+            const saAng = -Math.PI * 0.5 + tilt + (j - 2) * 0.34;
+            const sLen = Reff * 0.52 * stamGrow;
+            const ca = Math.cos(saAng), sa = Math.sin(saAng);
+            const bendS = (j - 2) * 0.06;
+
+            const tipX = hx + (sLen * ca - bendS * sLen * sa) / ASPECT;
+            const tipY = hy + (sLen * sa + bendS * sLen * ca);
+
+            for (let r = r0; r <= r1; r++) {
+              const gy = (r + 0.5) / ROWS;
+              const dy0 = gy - hy;
+              const ady = gy - tipY;
+              const rowOff = r * COLS;
+              for (let c = c0; c <= c1; c++) {
+                const idx = rowOff + c;
+                const gx = (c + 0.5) / COLS;
+                const adx = (gx - tipX) * ASPECT;
+
+                if (adx * adx + ady * ady <= antR * antR && zStam + 0.5 >= zBuf[idx]) {
+                  colR[idx] = 1.00;
+                  colG[idx] = 0.76;
+                  colB[idx] = 0.20;
+                  zBuf[idx] = zStam + 0.5;
+                  continue;
+                }
+
+                if (zStam < zBuf[idx]) continue;
+                const dx0 = (gx - hx) * ASPECT;
+                const s = (dx0 * ca + dy0 * sa) / (sLen + 1e-6);
+                if (s >= 0 && s <= 0.92) {
+                  const v = (-dx0 * sa + dy0 * ca) - bendS * sLen * s * s;
+                  if (Math.abs(v) <= 0.0045) {
+                    colR[idx] = 0.86;
+                    colG[idx] = 0.92;
+                    colB[idx] = 0.64;
+                    zBuf[idx] = zStam;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      function drawTulip(hx, hy, radius, tiltDeg, budScale, bloom, t, zBase, palette) {
+        if (budScale <= 0.02) return;
+        const tilt = (tiltDeg * Math.PI) / 180;
+        const Rbud = radius * (0.20 + 0.28 * budScale);
+        const breath = 1 + 0.018 * Math.sin(t * 1.4 + zBase) * bloom;
+        const Reff = (Rbud + (radius - Rbud) * bloom) * breath;
+        const maxR = Reff * 1.35;
+        const [r0, r1, c0, c1] = boundsFor(hx - maxR / ASPECT, hx + maxR / ASPECT, hy - maxR, hy + maxR);
+
+        const spread = 0.14 + 0.26 * bloom;
+        const petals = [
+          [-spread, false, 0.95],
+          [spread, false, 0.95],
+          [0, true, 1.04],
+        ];
+
+        for (const [angOff, isFront, lFac] of petals) {
+          const ang = -Math.PI * 0.5 + tilt + angOff;
+          const pLen = Reff * lFac;
+          const pWid = Reff * (isFront ? 0.42 : 0.36) * (0.60 + 0.40 * bloom);
+          const bend = -angOff * 0.35;
+          const ca = Math.cos(ang), sa = Math.sin(ang);
+
+          for (let r = r0; r <= r1; r++) {
+            const dy0 = (r + 0.5) / ROWS - hy;
+            const rowOff = r * COLS;
+            for (let c = c0; c <= c1; c++) {
+              const dx0 = ((c + 0.5) / COLS - hx) * ASPECT;
+              const s = (dx0 * ca + dy0 * sa) / (pLen + 1e-6);
+              if (s < 0 || s > 1) continue;
+
+              const zP = zBase + (isFront ? 1.4 : 0.6) + 0.2 * s;
+              const idx = rowOff + c;
+              if (zP < zBuf[idx]) continue;
+
+              const v = (-dx0 * sa + dy0 * ca) - bend * pLen * s * s;
+              const prof = Math.pow(Math.max(0, Math.sin(Math.PI * Math.pow(s, 0.62))), 0.72);
+              const wLoc = pWid * prof;
+              if (wLoc <= 0.001 || Math.abs(v) > wLoc) continue;
+
+              const vn = Math.abs(v) / (wLoc + 1e-6);
+              const rim = clamp((vn - 0.68) / 0.32);
+
+              let pr, pg, pb;
+              if (palette === "peach") {
+                pr = 0.98 - 0.04 * (1 - s);
+                pg = 0.46 + 0.34 * s + 0.14 * rim;
+                pb = 0.40 + 0.28 * s + 0.14 * rim;
+              } else {
+                pr = 0.70 + 0.24 * s + 0.10 * rim;
+                pg = 0.50 + 0.32 * s + 0.14 * rim;
+                pb = 0.96 + 0.04 * rim;
+              }
+
+              const shade = (isFront ? 0.98 : 0.80) * (0.72 + 0.28 * (1 - vn * 0.45)) * (0.65 + 0.35 * s);
+              colR[idx] = clamp(pr * shade);
+              colG[idx] = clamp(pg * shade);
+              colB[idx] = clamp(pb * shade);
+              zBuf[idx] = zP;
+            }
+          }
+        }
+      }
+
+      function drawDaisy(hx, hy, radius, tiltDeg, budScale, bloom, t, zBase) {
+        if (budScale <= 0.02) return;
+        const tilt = (tiltDeg * Math.PI) / 180;
+        const Reff = radius * (0.18 + 0.20 * budScale + 0.62 * bloom) * (1 + 0.02 * Math.sin(t * 1.6 + zBase) * bloom);
+        const maxR = Reff * 1.15;
+        const [r0, r1, c0, c1] = boundsFor(hx - maxR / ASPECT, hx + maxR / ASPECT, hy - maxR, hy + maxR);
+        const cR = Reff * (bloom > 0.2 ? 0.30 : 0.45);
+        const pInner = Reff * 0.24;
+
+        for (let r = r0; r <= r1; r++) {
+          const dy0 = (r + 0.5) / ROWS - hy;
+          const rowOff = r * COLS;
+          for (let c = c0; c <= c1; c++) {
+            const dx0 = ((c + 0.5) / COLS - hx) * ASPECT;
+            const rDist = Math.hypot(dx0, dy0);
+            if (rDist > maxR) continue;
+            const idx = rowOff + c;
+
+            if (rDist <= cR && zBase + 1.5 >= zBuf[idx]) {
+              const cn = 1 - rDist / (cR + 1e-6);
+              colR[idx] = clamp(0.94 + 0.06 * cn);
+              colG[idx] = clamp(0.64 + 0.30 * cn);
+              colB[idx] = clamp(0.08 + 0.18 * cn);
+              zBuf[idx] = zBase + 1.5;
+              continue;
+            }
+
+            if (bloom > 0.08 && rDist >= pInner && zBase + 0.5 >= zBuf[idx]) {
+              const th = Math.atan2(dy0, dx0) - tilt;
+              const pWave = Math.pow(Math.abs(Math.cos(th * 6)), 0.55);
+              const pOuter = Reff * (0.34 + 0.66 * pWave) * (0.35 + 0.65 * bloom);
+              if (rDist <= pOuter) {
+                const rn = clamp((rDist - pInner) / (pOuter - pInner + 1e-6));
+                const sh = 0.78 + 0.22 * rn;
+                colR[idx] = clamp(0.98 * sh);
+                colG[idx] = clamp((0.94 + 0.04 * rn) * sh);
+                colB[idx] = clamp((0.86 + 0.12 * rn) * sh);
+                zBuf[idx] = zBase + 0.5;
+              }
+            }
+          }
+        }
+      }
+
+      function drawForgetMeNot(hx, hy, radius, tiltDeg, budScale, bloom, t, zBase) {
+        if (budScale <= 0.02) return;
+        const tilt = (tiltDeg * Math.PI) / 180;
+        const Reff = radius * (0.20 + 0.20 * budScale + 0.60 * bloom) * (1 + 0.02 * Math.sin(t * 1.5 + zBase) * bloom);
+        const maxR = Reff * 1.15;
+        const [r0, r1, c0, c1] = boundsFor(hx - maxR / ASPECT, hx + maxR / ASPECT, hy - maxR, hy + maxR);
+        const eyeR = Reff * 0.24;
+
+        for (let r = r0; r <= r1; r++) {
+          const dy0 = (r + 0.5) / ROWS - hy;
+          const rowOff = r * COLS;
+          for (let c = c0; c <= c1; c++) {
+            const dx0 = ((c + 0.5) / COLS - hx) * ASPECT;
+            const rDist = Math.hypot(dx0, dy0);
+            if (rDist > maxR) continue;
+            const idx = rowOff + c;
+
+            if (rDist <= eyeR && zBase + 1.4 >= zBuf[idx]) {
+              colR[idx] = 1.00;
+              colG[idx] = 0.88;
+              colB[idx] = 0.28;
+              zBuf[idx] = zBase + 1.4;
+              continue;
+            }
+
+            if (zBase + 0.6 >= zBuf[idx]) {
+              const th = Math.atan2(dy0, dx0) - tilt;
+              const petShape = 0.52 + 0.48 * Math.pow(Math.max(0, Math.cos(th * 5)), 0.65);
+              const pOuter = Reff * petShape * (0.40 + 0.60 * bloom);
+              if (rDist <= pOuter) {
+                const rn = clamp(rDist / (pOuter + 1e-6));
+                colR[idx] = clamp(0.36 + 0.34 * rn);
+                colG[idx] = clamp(0.62 + 0.28 * rn);
+                colB[idx] = 0.98;
+                zBuf[idx] = zBase + 0.6;
+              }
+            }
+          }
+        }
+      }
+
+      function drawBabysBreath(bx, by, bloom, zVal) {
+        if (bloom <= 0.05) return;
+        const rMax = 0.022 * bloom;
+        const [r0, r1, c0, c1] = boundsFor(bx - rMax / ASPECT, bx + rMax / ASPECT, by - rMax, by + rMax);
+        for (let r = r0; r <= r1; r++) {
+          const dy = (r + 0.5) / ROWS - by;
+          const rowOff = r * COLS;
+          for (let c = c0; c <= c1; c++) {
+            const idx = rowOff + c;
+            if (zVal < zBuf[idx]) continue;
+            const dx = ((c + 0.5) / COLS - bx) * ASPECT;
+            const d2 = dx * dx + dy * dy;
+            if (d2 <= rMax * rMax) {
+              const sh = (1 - 0.35 * (Math.sqrt(d2) / (rMax + 1e-6))) * bloom;
+              colR[idx] = clamp(0.96 * sh);
+              colG[idx] = clamp(0.92 * sh);
+              colB[idx] = clamp(0.98 * sh);
+              zBuf[idx] = zVal;
+            }
+          }
+        }
+      }
+
+      // Animation state
+      let t0 = performance.now();
+      let lastT = 0;
+
+      function restart() {
+        t0 = performance.now();
+        lastT = 0;
+        replayBtn.classList.remove("visible");
+      }
+
+      replayBtn.addEventListener("click", restart);
+      window.addEventListener("keydown", (e) => {
+        if (e.code === "Space" || e.key === "r" || e.key === "R") {
+          restart();
+        }
+      });
+
+      function render(now) {
+        const t = (now - t0) / 1000;
+        const dt = clamp(t - lastT, 0, 0.1);
+        lastT = t;
+
+        // Clear buffers
+        colR.fill(0);
+        colG.fill(0);
+        colB.fill(0);
+        zBuf.fill(-100);
+
+        // Slow, poetic step-by-step bouquet growth timeline
+        const sMain = ease(t / 4.0);
+        const sLilL = ease((t - 2.0) / 2.6);
+        const sLilR = ease((t - 2.6) / 2.6);
+        const sTulL = ease((t - 3.2) / 2.4);
+        const sTulR = ease((t - 3.7) / 2.4);
+        const sDaiL = ease((t - 4.2) / 2.2);
+        const sDaiR = ease((t - 4.6) / 2.2);
+        const sFmnL = ease((t - 5.0) / 2.0);
+        const sFmnR = ease((t - 5.3) / 2.0);
+        const sDaiC = ease((t - 5.6) / 2.0);
+        const ribbonG = ease((t - 4.8) / 2.0);
+
+        // Sequential 1-by-1 blooms (1 -> 10)
+        const bLilC = ease((t - 5.4) / 2.6);
+        const bLilL = ease((t - 7.4) / 2.5);
+        const bLilR = ease((t - 9.2) / 2.5);
+        const bTulL = ease((t - 10.8) / 2.0);
+        const bTulR = ease((t - 12.0) / 2.0);
+        const bDaiL = ease((t - 13.0) / 1.8);
+        const bDaiR = ease((t - 14.0) / 1.8);
+        const bFmnL = ease((t - 14.8) / 1.6);
+        const bFmnR = ease((t - 15.5) / 1.6);
+        const bDaiC = ease((t - 16.2) / 1.8);
+
+        const sw = 0.010 * Math.sin(t * 0.90) * sMain;
+        const sw2 = 0.006 * Math.sin(t * 1.30 + 0.9) * sMain;
+
+        const tieX = 0.50 + sw * 0.25;
+        const tieY = 0.77;
+
+        const stems = [
+          [[0.50, 0.96], [tieX, tieY], [0.50 + sw, 0.28], sMain, 0.0078, 0.0],
+          [[0.53, 0.96], [tieX - 0.01, tieY], [0.24 + sw + sw2, 0.38], sLilL, 0.0066, -0.4],
+          [[0.47, 0.96], [tieX + 0.01, tieY], [0.76 + sw - sw2, 0.37], sLilR, 0.0066, -0.4],
+          [[0.52, 0.96], [tieX - 0.005, tieY], [0.35 + sw + sw2 * 0.5, 0.24], sTulL, 0.0056, -0.8],
+          [[0.48, 0.96], [tieX + 0.005, tieY], [0.65 + sw - sw2 * 0.5, 0.24], sTulR, 0.0056, -0.8],
+          [[0.55, 0.96], [tieX - 0.015, tieY], [0.20 + sw + sw2, 0.55], sDaiL, 0.0052, -0.6],
+          [[0.45, 0.96], [tieX + 0.015, tieY], [0.80 + sw - sw2, 0.54], sDaiR, 0.0052, -0.6],
+          [[0.51, 0.96], [tieX - 0.006, tieY], [0.38 + sw, 0.51], sFmnL, 0.0046, -0.2],
+          [[0.49, 0.96], [tieX + 0.006, tieY], [0.62 + sw, 0.50], sFmnR, 0.0046, -0.2],
+          [[0.50, 0.96], [tieX, tieY], [0.50 + sw * 0.8, 0.57], sDaiC, 0.0048, 0.2],
+        ];
+
+        // 1. Stems
+        for (const [p0, p1, p2, gr, hw, zv] of stems) {
+          drawCurveStem(p0, p1, p2, gr, hw, zv);
+        }
+
+        // 2. Framing foliage (Lily & Eucalyptus leaves)
+        const leaves = [
+          [tieX - 0.02, tieY - 0.04, -155, 0.27, 0.026,  0.16, 1.4, false],
+          [tieX + 0.02, tieY - 0.04,  -25, 0.27, 0.026, -0.16, 1.8, false],
+          [tieX - 0.03, tieY - 0.08, -142, 0.26, 0.025,  0.14, 2.4, true],
+          [tieX + 0.03, tieY - 0.08,  -38, 0.26, 0.025, -0.14, 2.8, true],
+          [tieX - 0.04, tieY - 0.14, -162, 0.24, 0.023,  0.18, 3.3, false],
+          [tieX + 0.04, tieY - 0.14,  -18, 0.24, 0.023, -0.18, 3.7, false],
+          [tieX - 0.05, tieY - 0.22, -135, 0.21, 0.022,  0.12, 4.2, true],
+          [tieX + 0.05, tieY - 0.22,  -45, 0.21, 0.022, -0.12, 4.5, true],
+          [tieX - 0.02, tieY - 0.18, -112, 0.22, 0.021,  0.08, 4.8, false],
+          [tieX + 0.02, tieY - 0.18,  -68, 0.22, 0.021, -0.08, 5.0, false],
+        ];
+        for (const [ax, ay, ang, lLen, lWid, bend, tSt, isTeal] of leaves) {
+          const lg = ease((t - tSt) / 2.2);
+          if (lg > 0.02) drawLeaf(ax, ay, ang, lLen, lWid, bend, lg, 0.4, isTeal);
+        }
+
+        // 3. Silk ribbon bow
+        drawRibbonBow(tieX, tieY, ribbonG, 22.0);
+
+        // 4. All 10 flowers riding their live branch tips, blooming 1 by 1
+        if (sTulL > 0.20) {
+          const [tx, ty] = quadBez(stems[3][0], stems[3][1], stems[3][2], sTulL);
+          drawTulip(tx, ty, 0.105, -18 + sw * 140, ease((t - 3.6) / 2.0), bTulL, t, 6.0, "peach");
+        }
+        if (sTulR > 0.20) {
+          const [tx, ty] = quadBez(stems[4][0], stems[4][1], stems[4][2], sTulR);
+          drawTulip(tx, ty, 0.105, 18 + sw * 140, ease((t - 4.1) / 2.0), bTulR, t, 6.0, "lavender");
+        }
+        if (sLilL > 0.18) {
+          const [lx, ly] = quadBez(stems[1][0], stems[1][1], stems[1][2], sLilL);
+          drawLilyHead(lx, ly, 0.150, -26 + sw * 150, ease((t - 2.4) / 2.2), bLilL, t, 9.0);
+        }
+        if (sLilR > 0.18) {
+          const [rx, ry] = quadBez(stems[2][0], stems[2][1], stems[2][2], sLilR);
+          drawLilyHead(rx, ry, 0.150, 26 + sw * 150, ease((t - 3.0) / 2.2), bLilR, t, 9.5);
+        }
+        if (sMain > 0.12) {
+          const [mx, my] = quadBez(stems[0][0], stems[0][1], stems[0][2], sMain);
+          drawLilyHead(mx, my, 0.172, sw * 140, ease((t - 0.5) / 3.4), bLilC, t, 13.0);
+        }
+        if (sDaiL > 0.22) {
+          const [dx, dy] = quadBez(stems[5][0], stems[5][1], stems[5][2], sDaiL);
+          drawDaisy(dx, dy, 0.095, -20 + sw * 150, ease((t - 4.6) / 1.8), bDaiL, t, 15.0);
+        }
+        if (sDaiR > 0.22) {
+          const [dx, dy] = quadBez(stems[6][0], stems[6][1], stems[6][2], sDaiR);
+          drawDaisy(dx, dy, 0.095, 20 + sw * 150, ease((t - 5.0) / 1.8), bDaiR, t, 15.0);
+        }
+        if (sFmnL > 0.25) {
+          const [fx, fy] = quadBez(stems[7][0], stems[7][1], stems[7][2], sFmnL);
+          drawForgetMeNot(fx, fy, 0.078, -10 + sw * 140, ease((t - 5.4) / 1.6), bFmnL, t, 17.0);
+        }
+        if (sFmnR > 0.25) {
+          const [fx, fy] = quadBez(stems[8][0], stems[8][1], stems[8][2], sFmnR);
+          drawForgetMeNot(fx, fy, 0.078, 10 + sw * 140, ease((t - 5.7) / 1.6), bFmnR, t, 17.0);
+        }
+        if (sDaiC > 0.25) {
+          const [cx, cy] = quadBez(stems[9][0], stems[9][1], stems[9][2], sDaiC);
+          drawDaisy(cx, cy, 0.088, sw * 140, ease((t - 6.0) / 1.6), bDaiC, t, 19.0);
+        }
+
+        // 5. Baby's Breath filler clusters
+        for (const [bx, by, tBb] of BABYS_BREATH) {
+          const bbG = ease((t - tBb) / 1.2);
+          if (bbG > 0.05) drawBabysBreath(bx + sw * 0.9, by, bbG, 21.0);
+        }
+
+        // 6. Floating sparkles
+        const bloomAny = Math.max(bLilC, bLilL, bLilR);
+        if (bloomAny > 0.15) {
+          for (let i = 0; i < N_SPARKS; i++) {
+            const sp = sparks[i];
+            sp.age += dt;
+            if (sp.age >= sp.life) {
+              sp.x = 0.16 + Math.random() * 0.68;
+              sp.y = 0.18 + Math.random() * 0.38;
+              sp.age = 0;
+              sp.life = 2.2 + Math.random() * 2.2;
+            }
+            sp.x += (sp.vx + 0.008 * Math.sin(sp.age * 2.4 + sp.life)) * dt;
+            sp.y += sp.vy * dt;
+
+            const a = Math.sin(Math.PI * (sp.age / sp.life)) * bloomAny;
+            if (a > 0.24) {
+              const rr = Math.floor(sp.y * ROWS);
+              const cc = Math.floor(sp.x * COLS);
+              if (rr >= 6 && rr < ROWS && cc >= 0 && cc < COLS) {
+                const idx = rr * COLS + cc;
+                if (zBuf[idx] < -50) {
+                  colR[idx] = 0.98 * a;
+                  colG[idx] = 0.78 * a;
+                  colB[idx] = 0.94 * a;
+                }
+              }
+            }
+          }
+        }
+
+        // 7. Paint ASCII grid onto HTML5 Canvas
+        ctx.fillStyle = "#020205";
+        ctx.fillRect(0, 0, W, H);
+        ctx.font = `bold ${asciiFontPx.toFixed(1)}px "Cascadia Mono", "Consolas", "Courier New", monospace`;
+
+        for (let r = 0; r < ROWS; r++) {
+          const py = (r + 0.5) * CH;
+          const rowOff = r * COLS;
+          for (let c = 0; c < COLS; c++) {
+            const idx = rowOff + c;
+            const cr = colR[idx], cg = colG[idx], cb = colB[idx];
+            const lum = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+            if (lum <= 0.04 && zBuf[idx] <= -50) continue;
+
+            const li = clamp(Math.pow(Math.max(0, lum), 0.78) + dither[idx]);
+            let ci = Math.floor(li * NR);
+            if (zBuf[idx] > -50 && ci < 4) ci = 4;
+            if (ci <= 0) continue;
+
+            const rr = Math.min(255, Math.floor(cr * 285));
+            const gg = Math.min(255, Math.floor(cg * 285));
+            const bb = Math.min(255, Math.floor(cb * 285));
+            ctx.fillStyle = `rgb(${rr},${gg},${bb})`;
+            ctx.fillText(RAMP[ci], (c + 0.5) * CW, py);
+          }
+        }
+
+        // 8. Draw small delicate message above the bouquet
+        const msgT = clamp((t - 15.8) / 3.0);
+        if (msgT > 0) {
+          const nChars = Math.round(ease(msgT) * MESSAGE.length);
+          const shown = MESSAGE.slice(0, nChars);
+          const shimmer = 0.88 + 0.12 * Math.sin(t * 2.0);
+          const mr = Math.floor(248 * shimmer);
+          const mg = Math.floor(214 * shimmer);
+          const mb = Math.floor(232 * shimmer);
+
+          ctx.font = `400 ${msgFontPx.toFixed(1)}px "Cascadia Mono", "Consolas", "Courier New", monospace`;
+          ctx.fillStyle = "#1c0d19";
+          ctx.fillText(shown, W * 0.5 + 1, H * 0.048 + 1);
+          ctx.fillStyle = `rgb(${mr},${mg},${mb})`;
+          ctx.fillText(shown, W * 0.5, H * 0.048);
+        }
+
+        if (t > 19.2 && !replayBtn.classList.contains("visible")) {
+          replayBtn.classList.add("visible");
+        }
+
+        requestAnimationFrame(render);
+      }
+
+      requestAnimationFrame(render);
+    })();
+  </script>
+</body>
+</html>
